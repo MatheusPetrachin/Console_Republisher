@@ -2,110 +2,110 @@
 using RabbitMQ.Client.Events;
 using Microsoft.Extensions.Configuration;
 using System.Text;
+using System.Collections.Generic;
 
 class Program
 {
     static void Main(string[] args)
     {
+        // Carrega configurações do appsettings.json
         var configuration = new ConfigurationBuilder()
             .SetBasePath(Directory.GetCurrentDirectory())
-            .AddJsonFile("appsettings.json")
+            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
             .Build();
+
+        var uri = configuration["RabbitMQ:Uri"];
+        var sourceQueue = configuration["RabbitMQ:SourceQueue"];
+        var targetQueue = configuration["RabbitMQ:TargetQueue"];
+        var exchangeName = configuration["RabbitMQ:ExchangeName"];
+
+        // Valida configurações obrigatórias
+        if (string.IsNullOrEmpty(uri) || string.IsNullOrEmpty(sourceQueue) || string.IsNullOrEmpty(targetQueue))
+        {
+            Console.WriteLine("Configuração inválida. Verifique RabbitMQ:Uri, SourceQueue e TargetQueue.");
+            return;
+        }
 
         var factory = new ConnectionFactory
         {
-            Uri = new Uri(configuration["RabbitMQ:Uri"]!)
+            Uri = new Uri(uri)
         };
 
         using var connection = factory.CreateConnection();
         using var channel = connection.CreateModel();
 
-        var sourceQueue = configuration["RabbitMQ:SourceQueue"];
-        var targetQueue = configuration["RabbitMQ:TargetQueue"];
-        var exchangeName = configuration["RabbitMQ:ExchangeName"];
-
-        Console.WriteLine($"Connecting to exchange: {exchangeName}");
-        Console.WriteLine($"Source queue: {sourceQueue}");
-        Console.WriteLine($"Target queue: {targetQueue}");
-
-        // Queue arguments
-        var dlqArgs = new Dictionary<string, object>
-        {
-            { "x-message-ttl", 60000 }, // 60 segundos TTL
-            { "x-queue-type", "classic" }
-        };
-
-        var mainQueueArgs = new Dictionary<string, object>
-        {
-            { "x-queue-type", "classic" }
-        };
+        Console.WriteLine($"Conectado ao RabbitMQ.");
+        Console.WriteLine($"Source Queue: {sourceQueue}");
+        Console.WriteLine($"Target Queue: {targetQueue}");
+        Console.WriteLine($"Exchange (se aplicável): {exchangeName}");
 
         try
         {
-            // Verificar se as filas existem antes de tentar declarar
+            // Verifica se as filas existem
             channel.QueueDeclarePassive(sourceQueue);
             channel.QueueDeclarePassive(targetQueue);
 
-            // Garantir que a fila de destino está vinculada ao exchange
-            channel.QueueBind(targetQueue, exchangeName, targetQueue);
+            if (!string.IsNullOrEmpty(exchangeName))
+            {
+                // Se o exchange foi definido, faz o bind da fila de destino
+                channel.QueueBind(targetQueue, exchangeName, targetQueue);
+            }
 
-            Console.WriteLine("Queues verified and bound successfully");
+            Console.WriteLine("Filas verificadas e vinculadas com sucesso.");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error setting up queues: {ex.Message}");
+            Console.WriteLine($"Erro ao configurar as filas: {ex.Message}");
             return;
         }
-
-        Console.WriteLine($"Starting to listen on queue: {sourceQueue}");
-        Console.WriteLine($"Messages will be republished to: {targetQueue}");
 
         var consumer = new EventingBasicConsumer(channel);
         consumer.Received += (model, ea) =>
         {
             var body = ea.Body.ToArray();
             var message = Encoding.UTF8.GetString(body);
-            Console.WriteLine($"Received message: {message}");
+            Console.WriteLine($"Mensagem recebida: {message}");
 
             try
             {
-                // Republish the message to the target queue
                 var properties = channel.CreateBasicProperties();
-                properties.DeliveryMode = 2; // mensagem persistente
-                properties.Headers = ea.BasicProperties.Headers; // preserva os headers originais
+                properties.DeliveryMode = 2; // Persistente
+                properties.Headers = ea.BasicProperties?.Headers;
 
+                // Publica no exchange especificado ou diretamente na fila
                 channel.BasicPublish(
-                    exchange: "",  // Publicando diretamente na fila
+                    exchange: "", // Publica direto na fila e não no exchange
                     routingKey: targetQueue,
                     basicProperties: properties,
-                    body: body);
+                    body: body
+                );
 
-                // Acknowledge the message from the source queue
+                // Acknowledgement
                 channel.BasicAck(ea.DeliveryTag, false);
+                Console.WriteLine($"Mensagem publicada em: {targetQueue}");
 
-                Console.WriteLine($"Message republished successfully to queue: {targetQueue}");
-
-                // Verificar quantidade de mensagens na fila de destino
-                var targetQueueDeclare = channel.QueueDeclarePassive(targetQueue);
-                Console.WriteLine($"Messages in target queue: {targetQueueDeclare.MessageCount}");
+                // Opcional: Mostra contagem atual na fila de destino
+                var targetInfo = channel.QueueDeclarePassive(targetQueue);
+                Console.WriteLine($"Mensagens na fila de destino: {targetInfo.MessageCount}");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error republishing message: {ex.Message}");
-                Console.WriteLine($"Stack trace: {ex.StackTrace}");
-                // Negative acknowledge the message to retry
+                Console.WriteLine($"Erro ao republicar mensagem: {ex.Message}");
                 channel.BasicNack(ea.DeliveryTag, false, true);
             }
         };
 
-        // Start consuming messages with prefetch count
-        channel.BasicQos(0, 15, false); // processa 15 mensagens por vez
+        // Define o prefetch para limitar a quantidade de mensagens não confirmadas
+        channel.BasicQos(0, 15, false);
+
+        // Inicia o consumo da fila
         channel.BasicConsume(
             queue: sourceQueue,
             autoAck: false,
-            consumer: consumer);
+            consumer: consumer
+        );
 
-        Console.WriteLine("Press [enter] to exit.");
+        Console.WriteLine("Pressione [Enter] para sair...");
         Console.ReadLine();
     }
 }
